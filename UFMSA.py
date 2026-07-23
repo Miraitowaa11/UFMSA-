@@ -10,7 +10,7 @@ import os
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Tuple
 
 import numpy as np
 import torch
@@ -25,10 +25,24 @@ except ImportError:
     AutoImageProcessor = None
     AutoModel = None
     AutoTokenizer = None
+try:
+    from ray import tune
+    from ray.tune.search.basic_variant import BasicVariantGenerator
+except ImportError:
+    tune = None
+    BasicVariantGenerator = None
 
 LOGGER = logging.getLogger("ufmsa")
 PAPER_SEEDS: Tuple[int, ...] = (13, 21, 43, 2026, 3407)
-
+LEARNING_RATE_FIELDS: Tuple[str, ...] = (
+    "text_learning_rate",
+    "visual_learning_rate",
+    "frequency_learning_rate",
+    "smca_learning_rate",
+    "moe_learning_rate",
+    "uncertainty_learning_rate",
+    "classifier_learning_rate",
+)
 
 @dataclass
 class UFMSAConfig:
@@ -37,6 +51,8 @@ class UFMSAConfig:
     image_root: str = "PATH_TO_IMAGE_ROOT"
     output_dir: str = "PATH_TO_OUTPUT_DIRECTORY"
     local_files_only: bool = False
+    dataset_name: str = "weibo"
+    max_text_length: int = 160
 
     num_labels: int = 2
     model_dim: int = 512
@@ -74,8 +90,6 @@ class UFMSAConfig:
     max_grad_norm: float = 1.0
     num_workers: int = 4
 
-    mc_scope: str = "full"
-
     def validate(self) -> None:
         if self.model_dim % self.num_attention_heads != 0:
             raise ValueError("model_dim must be divisible by num_attention_heads")
@@ -88,9 +102,13 @@ class UFMSAConfig:
             )
         if self.mc_samples < 1:
             raise ValueError("mc_samples must be at least 1")
-        if self.mc_scope not in {"full", "projection_smca"}:
-            raise ValueError("mc_scope must be 'full' or 'projection_smca'")
-
+        if self.dataset_name not in {"weibo", "finefake", "pheme"}:
+            raise ValueError("dataset_name must be one of: weibo, finefake, pheme")
+        expected_length = 160 if self.dataset_name == "weibo" else 50
+        if self.max_text_length != expected_length:
+            raise ValueError(
+                f"max_text_length must be {expected_length} for {self.dataset_name}"
+            )
 
 def set_global_seed(seed: int) -> None:
 
@@ -105,7 +123,6 @@ def set_global_seed(seed: int) -> None:
         torch.use_deterministic_algorithms(True, warn_only=True)
     except AttributeError:
         pass
-
 
 @contextlib.contextmanager
 def mc_dropout_mode(module: nn.Module) -> Iterator[None]:
@@ -130,7 +147,6 @@ def mc_dropout_mode(module: nn.Module) -> Iterator[None]:
     finally:
         for submodule, state in states.items():
             submodule.train(state)
-
 
 def _read_manifest(path: Path) -> List[Dict[str, Any]]:
     if not path.exists():
@@ -164,9 +180,88 @@ def _read_manifest(path: Path) -> List[Dict[str, Any]]:
 
     raise ValueError("Manifest must be .jsonl, .json, or .csv")
 
+def _manifest_record_key(row: Mapping[str, Any], source: Path, index: int) -> str:
+    sample_id = str(row.get("sample_id", "")).strip()
+    if sample_id:
+        return sample_id
+    text_value = str(row.get("text", ""))
+    image_value = str(row.get("image_path", ""))
+    if not text_value or not image_value:
+        raise ValueError(f"Cannot identify record {index} in {source}")
+    return json.dumps([text_value, image_value], ensure_ascii=False)
+
+def validate_main_experiment_manifests(
+    train_manifest: str,
+    validation_manifest: str,
+    test_manifest: str,
+    tolerance: float = 0.01,
+) -> Dict[str, Any]:
+    if tolerance < 0:
+        raise ValueError("split tolerance must be nonnegative")
+    sources = {
+        "train": Path(train_manifest),
+        "validation": Path(validation_manifest),
+        "test": Path(test_manifest),
+    }
+    rows = {name: _read_manifest(path) for name, path in sources.items()}
+    if any(len(records) == 0 for records in rows.values()):
+        raise ValueError("training, validation, and test manifests must be nonempty")
+    keys: Dict[str, set[str]] = {}
+    label_counts: Dict[str, Dict[int, int]] = {}
+    for split_name, records in rows.items():
+        split_keys: List[str] = []
+        counts = {0: 0, 1: 0}
+        for index, row in enumerate(records):
+            label = int(row.get("label", -1))
+            if label not in counts:
+                raise ValueError(
+                    f"Record {index} in {sources[split_name]} has a non-binary label"
+                )
+            counts[label] += 1
+            split_keys.append(
+                _manifest_record_key(row, sources[split_name], index)
+            )
+        if len(split_keys) != len(set(split_keys)):
+            raise ValueError(f"Duplicate samples were found in the {split_name} split")
+        if counts[0] == 0 or counts[1] == 0:
+            raise ValueError(f"Both classes must occur in the {split_name} split")
+        keys[split_name] = set(split_keys)
+        label_counts[split_name] = counts
+    if keys["train"] & keys["validation"]:
+        raise ValueError("Training and validation manifests overlap")
+    if keys["train"] & keys["test"]:
+        raise ValueError("Training and test manifests overlap")
+    if keys["validation"] & keys["test"]:
+        raise ValueError("Validation and test manifests overlap")
+    targets = {"train": 0.72, "validation": 0.08, "test": 0.20}
+    total = sum(len(records) for records in rows.values())
+    proportions = {
+        name: len(records) / total for name, records in rows.items()
+    }
+    for name, target in targets.items():
+        if abs(proportions[name] - target) > tolerance:
+            raise ValueError(
+                f"{name} proportion {proportions[name]:.6f} does not match {target:.2f}"
+            )
+    class_totals = {
+        label: sum(label_counts[name][label] for name in rows)
+        for label in (0, 1)
+    }
+    for label in (0, 1):
+        for name, target in targets.items():
+            class_proportion = label_counts[name][label] / class_totals[label]
+            if abs(class_proportion - target) > tolerance:
+                raise ValueError(
+                    f"Class {label} is not stratified in the {name} split"
+                )
+    return {
+        "total": total,
+        "split_sizes": {name: len(records) for name, records in rows.items()},
+        "split_proportions": proportions,
+        "label_counts": label_counts,
+    }
 
 class MultimodalManifestDataset(Dataset):
-
 
     REQUIRED_FIELDS = ("text", "image_path", "label")
 
@@ -212,7 +307,11 @@ class MultimodalManifestDataset(Dataset):
 
         with Image.open(image_path) as image_file:
             image = image_file.convert("RGB")
-            vit_inputs = self.image_processor(images=image, return_tensors="pt")
+            vit_inputs = self.image_processor(
+                images=image,
+                size={"height": self.image_size, "width": self.image_size},
+                return_tensors="pt",
+            )
             pixel_values = vit_inputs["pixel_values"].squeeze(0)
 
             gray = image.convert("L").resize(
@@ -239,7 +338,6 @@ class MultimodalManifestDataset(Dataset):
             "domain": str(row.get("domain", "")),
         }
         return output
-
 
 def build_dataloader(
     manifest_path: str,
@@ -273,9 +371,6 @@ def build_dataloader(
         persistent_workers=num_workers > 0,
     )
 
-
-
-
 class TextEncoder(nn.Module):
 
     def __init__(self, config: UFMSAConfig) -> None:
@@ -302,7 +397,6 @@ class TextEncoder(nn.Module):
         feature = F.relu(self.projection(cls_feature))
         feature = self.norm(feature)
         return self.dropout(feature)
-
 
 class VisualEncoder(nn.Module):
 
@@ -331,9 +425,7 @@ class VisualEncoder(nn.Module):
         feature = self.norm(feature)
         return self.dropout(feature)
 
-
 class DiscreteStockwellTransform1D(nn.Module):
-
 
     def __init__(self, signal_length: int, frequency_bins: int, eps: float = 1.0e-6) -> None:
         super().__init__()
@@ -392,7 +484,6 @@ class DiscreteStockwellTransform1D(nn.Module):
         mean = tensor.mean(dim=-1, keepdim=True)
         std = tensor.std(dim=-1, keepdim=True, unbiased=False).clamp_min(self.eps)
         return (tensor - mean) / std
-
 
 class FrequencyEncoder(nn.Module):
 
@@ -456,9 +547,7 @@ class FrequencyEncoder(nn.Module):
         feature = self.norm(feature)
         return self.dropout(feature)
 
-
-
-class TwoSourceMultiHeadAttention(nn.Module):
+class DirectionalFeatureAttention(nn.Module):
 
     def __init__(self, model_dim: int, num_heads: int, dropout: float) -> None:
         super().__init__()
@@ -467,48 +556,52 @@ class TwoSourceMultiHeadAttention(nn.Module):
         self.model_dim = model_dim
         self.num_heads = num_heads
         self.head_dim = model_dim // num_heads
-        self.q_proj = nn.Linear(model_dim, model_dim)
-        self.k_proj = nn.Linear(model_dim, model_dim)
-        self.v_proj = nn.Linear(model_dim, model_dim)
-        self.out_proj = nn.Linear(model_dim, model_dim)
-        self.attn_dropout = nn.Dropout(dropout)
-        self.out_dropout = nn.Dropout(dropout)
+        self.output_projection = nn.Linear(model_dim, model_dim)
+        self.attention_dropout = nn.Dropout(dropout)
+        self.output_dropout = nn.Dropout(dropout)
 
     def forward(
-        self, query: torch.Tensor, source_a: torch.Tensor, source_b: torch.Tensor
+        self,
+        projected_query: torch.Tensor,
+        projected_key: torch.Tensor,
+        projected_value: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size = query.shape[0]
-        sources = torch.stack([source_a, source_b], dim=1)
-
-        q = self.q_proj(query).view(batch_size, self.num_heads, self.head_dim)
-        k = self.k_proj(sources).view(
-            batch_size, 2, self.num_heads, self.head_dim
-        ).permute(0, 2, 1, 3)
-        v = self.v_proj(sources).view(
-            batch_size, 2, self.num_heads, self.head_dim
-        ).permute(0, 2, 1, 3)
-
-        scores = torch.einsum("bhd,bhsd->bhs", q, k) / math.sqrt(self.head_dim)
+        batch_size = projected_query.shape[0]
+        query = projected_query.reshape(batch_size, self.num_heads, self.head_dim)
+        key = projected_key.reshape(batch_size, self.num_heads, self.head_dim)
+        value = projected_value.reshape(batch_size, self.num_heads, self.head_dim)
+        scores = torch.einsum("bhi,bhj->bhij", query, key) / math.sqrt(self.head_dim)
         weights = F.softmax(scores, dim=-1)
-        weights = self.attn_dropout(weights)
-        context = torch.einsum("bhs,bhsd->bhd", weights, v)
+        weights = self.attention_dropout(weights)
+        context = torch.einsum("bhij,bhj->bhi", weights, value)
         context = context.reshape(batch_size, self.model_dim)
-        output = self.out_dropout(self.out_proj(context))
+        output = self.output_dropout(self.output_projection(context))
         return output, weights
-
 
 class SymmetricMultimodalCoAttention(nn.Module):
 
     def __init__(self, config: UFMSAConfig) -> None:
         super().__init__()
-        self.text_attention = TwoSourceMultiHeadAttention(
-            config.model_dim, config.num_attention_heads, config.dropout
+        modalities = ("t", "d", "v")
+        directions = ("td", "tv", "dt", "dv", "vt", "vd")
+        self.query_projections = nn.ModuleDict(
+            {name: nn.Linear(config.model_dim, config.model_dim) for name in modalities}
         )
-        self.frequency_attention = TwoSourceMultiHeadAttention(
-            config.model_dim, config.num_attention_heads, config.dropout
+        self.key_projections = nn.ModuleDict(
+            {name: nn.Linear(config.model_dim, config.model_dim) for name in modalities}
         )
-        self.visual_attention = TwoSourceMultiHeadAttention(
-            config.model_dim, config.num_attention_heads, config.dropout
+        self.value_projections = nn.ModuleDict(
+            {name: nn.Linear(config.model_dim, config.model_dim) for name in modalities}
+        )
+        self.directional_attention = nn.ModuleDict(
+            {
+                name: DirectionalFeatureAttention(
+                    config.model_dim,
+                    config.num_attention_heads,
+                    config.dropout,
+                )
+                for name in directions
+            }
         )
         self.text_norm = nn.LayerNorm(config.model_dim)
         self.frequency_norm = nn.LayerNorm(config.model_dim)
@@ -520,24 +613,49 @@ class SymmetricMultimodalCoAttention(nn.Module):
         frequency_feature: torch.Tensor,
         visual_feature: torch.Tensor,
     ) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]]:
-        text_context, text_weights = self.text_attention(
-            text_feature, frequency_feature, visual_feature
-        )
-        frequency_context, frequency_weights = self.frequency_attention(
-            frequency_feature, text_feature, visual_feature
-        )
-        visual_context, visual_weights = self.visual_attention(
-            visual_feature, text_feature, frequency_feature
-        )
+        features = {
+            "t": text_feature,
+            "d": frequency_feature,
+            "v": visual_feature,
+        }
+        queries = {
+            name: self.query_projections[name](feature)
+            for name, feature in features.items()
+        }
+        keys = {
+            name: self.key_projections[name](feature)
+            for name, feature in features.items()
+        }
+        values = {
+            name: self.value_projections[name](feature)
+            for name, feature in features.items()
+        }
+        outputs: Dict[str, torch.Tensor] = {}
+        weights: Dict[str, torch.Tensor] = {}
+        for direction in ("td", "tv", "dt", "dv", "vt", "vd"):
+            query_modality, source_modality = direction
+            output, attention = self.directional_attention[direction](
+                queries[query_modality],
+                keys[source_modality],
+                values[source_modality],
+            )
+            outputs[direction] = output
+            weights[direction] = attention
 
-        enhanced_text = self.text_norm(text_feature + text_context)
-        enhanced_frequency = self.frequency_norm(frequency_feature + frequency_context)
-        enhanced_visual = self.visual_norm(visual_feature + visual_context)
-
+        enhanced_text = self.text_norm(text_feature + outputs["td"] + outputs["tv"])
+        enhanced_frequency = self.frequency_norm(
+            frequency_feature + outputs["dt"] + outputs["dv"]
+        )
+        enhanced_visual = self.visual_norm(
+            visual_feature + outputs["vt"] + outputs["vd"]
+        )
         attention_map = {
-            "text_from_frequency_visual": text_weights,
-            "frequency_from_text_visual": frequency_weights,
-            "visual_from_text_frequency": visual_weights,
+            "t_to_d": weights["td"],
+            "t_to_v": weights["tv"],
+            "d_to_t": weights["dt"],
+            "d_to_v": weights["dv"],
+            "v_to_t": weights["vt"],
+            "v_to_d": weights["vd"],
         }
         return (enhanced_text, enhanced_frequency, enhanced_visual), attention_map
 
@@ -553,7 +671,6 @@ class FeedForwardExpert(nn.Module):
 
     def forward(self, unified_input: torch.Tensor) -> torch.Tensor:
         return self.network(unified_input)
-
 
 class SampleAdaptiveMoE(nn.Module):
 
@@ -631,7 +748,6 @@ class SampleAdaptiveMoE(nn.Module):
         }
         return moe_feature, details
 
-
 class ModalityDecisionHead(nn.Module):
 
     def __init__(self, config: UFMSAConfig) -> None:
@@ -644,7 +760,6 @@ class ModalityDecisionHead(nn.Module):
         hidden = F.relu(self.fc1(feature))
         hidden = self.dropout(hidden)
         return self.fc2(hidden)
-
 
 class HierarchicalUncertaintyFusion(nn.Module):
 
@@ -659,7 +774,7 @@ class HierarchicalUncertaintyFusion(nn.Module):
     @staticmethod
     def _feature_uncertainty(samples: torch.Tensor) -> torch.Tensor:
         sample_mean = samples.mean(dim=0, keepdim=True)
-        return (samples - sample_mean).square().mean(dim=-1).mean(dim=0)
+        return (samples - sample_mean).square().sum(dim=-1).mean(dim=0)
 
     def _decision_uncertainty(
         self, samples: torch.Tensor
@@ -720,7 +835,6 @@ class HierarchicalUncertaintyFusion(nn.Module):
         }
         return hufn_feature, global_uncertainty, details
 
-
 class UncertaintyAdaptiveFusion(nn.Module):
     def __init__(self, config: UFMSAConfig) -> None:
         super().__init__()
@@ -738,7 +852,6 @@ class UncertaintyAdaptiveFusion(nn.Module):
         fusion_weight = torch.sigmoid(beta * (self.tau - global_uncertainty))
         final_feature = fusion_weight * moe_feature + (1.0 - fusion_weight) * hufn_feature
         return final_feature, fusion_weight, {"beta": beta, "tau": self.tau}
-
 
 class UFMSA(nn.Module):
     def __init__(self, config: UFMSAConfig) -> None:
@@ -779,28 +892,23 @@ class UFMSA(nn.Module):
 
     def _sample_smca_features(
         self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        pixel_values: torch.Tensor,
-        frequency_image: torch.Tensor,
-        cached_modalities: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        enhanced_features: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         sampled_features: List[torch.Tensor] = []
-        with mc_dropout_mode(self):
-            for _ in range(self.config.mc_samples):
-                if self.config.mc_scope == "full":
-                    modality_features = self._encode_modalities(
-                        input_ids, attention_mask, pixel_values, frequency_image
-                    )
-                else:
-                    if cached_modalities is None:
-                        raise RuntimeError("cached_modalities are required for projection_smca MC scope")
-                    modality_features = tuple(
-                        F.dropout(feature, p=self.config.dropout, training=True)
-                        for feature in cached_modalities
-                    )
-                enhanced, _ = self._smca_once(modality_features)
-                sampled_features.append(torch.stack(enhanced, dim=1))
+        for _ in range(self.config.mc_samples):
+            sampled_features.append(
+                torch.stack(
+                    [
+                        F.dropout(
+                            feature,
+                            p=self.config.dropout,
+                            training=True,
+                        )
+                        for feature in enhanced_features
+                    ],
+                    dim=1,
+                )
+            )
         return torch.stack(sampled_features, dim=0)
 
     def forward(
@@ -817,13 +925,7 @@ class UFMSA(nn.Module):
         enhanced_features, attention_map = self._smca_once(modality_features)
         moe_feature, moe_details = self.moe(*enhanced_features)
 
-        mc_samples = self._sample_smca_features(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            pixel_values=pixel_values,
-            frequency_image=frequency_image,
-            cached_modalities=modality_features,
-        )
+        mc_samples = self._sample_smca_features(enhanced_features)
 
         with mc_dropout_mode(self.hufn):
             hufn_feature, global_uncertainty, hufn_details = self.hufn(
@@ -863,11 +965,12 @@ class UFMSA(nn.Module):
                     "alpha": hufn_details["alpha"],
                     "beta": uaf_details["beta"],
                     "tau": uaf_details["tau"],
-                    "smca_text_weights": attention_map["text_from_frequency_visual"],
-                    "smca_frequency_weights": attention_map[
-                        "frequency_from_text_visual"
-                    ],
-                    "smca_visual_weights": attention_map["visual_from_text_frequency"],
+                    "smca_t_to_d_weights": attention_map["t_to_d"],
+                    "smca_t_to_v_weights": attention_map["t_to_v"],
+                    "smca_d_to_t_weights": attention_map["d_to_t"],
+                    "smca_d_to_v_weights": attention_map["d_to_v"],
+                    "smca_v_to_t_weights": attention_map["v_to_t"],
+                    "smca_v_to_d_weights": attention_map["v_to_d"],
                 }
             )
         return output
@@ -887,7 +990,6 @@ class UFMSA(nn.Module):
             "total_loss": total_loss.detach(),
         }
 
-
 @dataclass
 class Metrics:
     accuracy: float
@@ -896,15 +998,18 @@ class Metrics:
     macro_f1: float
     loss: float
 
-
 def _move_batch(batch: Mapping[str, Any], device: torch.device) -> Dict[str, Any]:
     moved: Dict[str, Any] = {}
     for key, value in batch.items():
         moved[key] = value.to(device, non_blocking=True) if torch.is_tensor(value) else value
     return moved
 
-
-def evaluate(model: UFMSA, loader: DataLoader, device: torch.device) -> Tuple[Metrics, Dict[str, Any]]:
+def evaluate(
+    model: UFMSA,
+    loader: DataLoader,
+    device: torch.device,
+    collect_details: bool = True,
+) -> Tuple[Metrics, Dict[str, Any]]:
     model.eval()
     losses: List[float] = []
     labels_all: List[int] = []
@@ -927,24 +1032,25 @@ def evaluate(model: UFMSA, loader: DataLoader, device: torch.device) -> Tuple[Me
             labels_all.extend(batch["label"].cpu().tolist())
             predictions_all.extend(predictions.cpu().tolist())
 
-            for index, sample_id in enumerate(batch["sample_id"]):
-                sample_records.append(
-                    {
-                        "sample_id": str(sample_id),
-                        "label": int(batch["label"][index].item()),
-                        "prediction": int(predictions[index].item()),
-                        "probabilities": output["probabilities"][index].cpu().tolist(),
-                        "gate_weights": output["gate_weights"][index].cpu().tolist(),
-                        "similarity_td": float(output["similarity_td"][index].item()),
-                        "similarity_tv": float(output["similarity_tv"][index].item()),
-                        "similarity_dv": float(output["similarity_dv"][index].item()),
-                        "confidence_weights": output["confidence_weights"][index].cpu().tolist(),
-                        "feature_uncertainty": output["feature_uncertainty"][index].cpu().tolist(),
-                        "decision_uncertainty": output["decision_uncertainty"][index].cpu().tolist(),
-                        "global_uncertainty": float(output["global_uncertainty"][index].item()),
-                        "fusion_weight": float(output["fusion_weight"][index].item()),
-                    }
-                )
+            if collect_details:
+                for index, sample_id in enumerate(batch["sample_id"]):
+                    sample_records.append(
+                        {
+                            "sample_id": str(sample_id),
+                            "label": int(batch["label"][index].item()),
+                            "prediction": int(predictions[index].item()),
+                            "probabilities": output["probabilities"][index].cpu().tolist(),
+                            "gate_weights": output["gate_weights"][index].cpu().tolist(),
+                            "similarity_td": float(output["similarity_td"][index].item()),
+                            "similarity_tv": float(output["similarity_tv"][index].item()),
+                            "similarity_dv": float(output["similarity_dv"][index].item()),
+                            "confidence_weights": output["confidence_weights"][index].cpu().tolist(),
+                            "feature_uncertainty": output["feature_uncertainty"][index].cpu().tolist(),
+                            "decision_uncertainty": output["decision_uncertainty"][index].cpu().tolist(),
+                            "global_uncertainty": float(output["global_uncertainty"][index].item()),
+                            "fusion_weight": float(output["fusion_weight"][index].item()),
+                        }
+                    )
 
     precision, recall, f1, _ = precision_recall_fscore_support(
         labels_all,
@@ -960,7 +1066,6 @@ def evaluate(model: UFMSA, loader: DataLoader, device: torch.device) -> Tuple[Me
         loss=float(np.mean(losses)) if losses else float("nan"),
     )
     return metrics, {"samples": sample_records}
-
 
 def build_optimizer(model: UFMSA, config: UFMSAConfig) -> torch.optim.Optimizer:
 
@@ -1030,6 +1135,233 @@ def build_optimizer(model: UFMSA, config: UFMSAConfig) -> torch.optim.Optimizer:
         print_change_log=False,
     )
 
+def train_epoch(
+    model: UFMSA,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    max_grad_norm: float,
+) -> float:
+    model.train()
+    losses: List[float] = []
+    for batch in loader:
+        batch = _move_batch(batch, device)
+        optimizer.zero_grad(set_to_none=True)
+        output = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            pixel_values=batch["pixel_values"],
+            frequency_image=batch["frequency_image"],
+            return_details=False,
+        )
+        loss, _ = model.compute_loss(output, batch["label"])
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"Non-finite loss encountered: {loss.item()}")
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        optimizer.step()
+        losses.append(float(loss.item()))
+    return float(np.mean(losses)) if losses else float("nan")
+
+def load_processors(config: UFMSAConfig) -> Tuple[Any, Any]:
+    if AutoTokenizer is None or AutoImageProcessor is None:
+        raise ImportError(
+            "The `transformers` package is required. Install it with `pip install transformers`."
+        )
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.roberta_name_or_path,
+        local_files_only=config.local_files_only,
+        use_fast=True,
+    )
+    image_processor = AutoImageProcessor.from_pretrained(
+        config.vit_name_or_path,
+        local_files_only=config.local_files_only,
+    )
+    return tokenizer, image_processor
+
+def config_with_learning_rates(
+    base_config: UFMSAConfig,
+    learning_rates: Mapping[str, float],
+) -> UFMSAConfig:
+    payload = asdict(base_config)
+    for field in LEARNING_RATE_FIELDS:
+        if field not in learning_rates:
+            raise KeyError(f"Missing tuned parameter: {field}")
+        payload[field] = float(learning_rates[field])
+    selected = UFMSAConfig(**payload)
+    selected.validate()
+    return selected
+
+def ray_tune_trainable(
+    trial_parameters: Mapping[str, float],
+    base_config_payload: Mapping[str, Any],
+    train_manifest: str,
+    validation_manifest: str,
+    tuning_seed: int,
+) -> None:
+    if tune is None:
+        raise ImportError("Ray Tune is required. Install it with `pip install 'ray[tune]'`.")
+    base_config = UFMSAConfig(**dict(base_config_payload))
+    trial_config = config_with_learning_rates(base_config, trial_parameters)
+    set_global_seed(tuning_seed)
+    tokenizer, image_processor = load_processors(trial_config)
+    train_loader = build_dataloader(
+        manifest_path=train_manifest,
+        tokenizer=tokenizer,
+        image_processor=image_processor,
+        image_root=trial_config.image_root,
+        max_text_length=trial_config.max_text_length,
+        image_size=trial_config.image_size,
+        batch_size=trial_config.batch_size,
+        shuffle=True,
+        num_workers=trial_config.num_workers,
+        seed=tuning_seed,
+    )
+    validation_loader = build_dataloader(
+        manifest_path=validation_manifest,
+        tokenizer=tokenizer,
+        image_processor=image_processor,
+        image_root=trial_config.image_root,
+        max_text_length=trial_config.max_text_length,
+        image_size=trial_config.image_size,
+        batch_size=trial_config.batch_size,
+        shuffle=False,
+        num_workers=trial_config.num_workers,
+        seed=tuning_seed,
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = UFMSA(trial_config).to(device)
+    optimizer = build_optimizer(model, trial_config)
+    best_validation_f1 = -float("inf")
+    epochs_without_improvement = 0
+    for epoch in range(1, trial_config.max_epochs + 1):
+        training_loss = train_epoch(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            max_grad_norm=trial_config.max_grad_norm,
+        )
+        validation_metrics, _ = evaluate(
+            model,
+            validation_loader,
+            device,
+            collect_details=False,
+        )
+        if validation_metrics.macro_f1 > best_validation_f1:
+            best_validation_f1 = validation_metrics.macro_f1
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+        tune.report(
+            {
+                "epoch": epoch,
+                "training_loss": training_loss,
+                "validation_loss": validation_metrics.loss,
+                "validation_accuracy": validation_metrics.accuracy,
+                "validation_macro_precision": validation_metrics.macro_precision,
+                "validation_macro_recall": validation_metrics.macro_recall,
+                "validation_macro_f1": validation_metrics.macro_f1,
+                "best_validation_macro_f1": best_validation_f1,
+            }
+        )
+        if epochs_without_improvement >= trial_config.early_stopping_patience:
+            break
+
+def run_ray_tune(
+    config: UFMSAConfig,
+    train_manifest: str,
+    validation_manifest: str,
+    num_samples: int,
+    minimum_learning_rate: float,
+    maximum_learning_rate: float,
+    tuning_seed: int,
+    cpus_per_trial: float,
+    gpus_per_trial: float,
+    max_concurrent_trials: int,
+    experiment_name: str,
+) -> Dict[str, float]:
+    if tune is None or BasicVariantGenerator is None:
+        raise ImportError("Ray Tune is required. Install it with `pip install 'ray[tune]'`.")
+    if num_samples < 1:
+        raise ValueError("ray_tune_num_samples must be at least 1")
+    if minimum_learning_rate <= 0 or maximum_learning_rate <= minimum_learning_rate:
+        raise ValueError("Ray Tune learning-rate bounds are invalid")
+    if cpus_per_trial <= 0 or gpus_per_trial < 0:
+        raise ValueError("Ray Tune resource values are invalid")
+    if max_concurrent_trials < 1:
+        raise ValueError("ray_tune_max_concurrent_trials must be at least 1")
+    search_space = {
+        field: tune.loguniform(minimum_learning_rate, maximum_learning_rate)
+        for field in LEARNING_RATE_FIELDS
+    }
+    trainable = tune.with_parameters(
+        ray_tune_trainable,
+        base_config_payload=asdict(config),
+        train_manifest=train_manifest,
+        validation_manifest=validation_manifest,
+        tuning_seed=tuning_seed,
+    )
+    trainable = tune.with_resources(
+        trainable,
+        resources={"cpu": cpus_per_trial, "gpu": gpus_per_trial},
+    )
+    search_algorithm = BasicVariantGenerator(
+        random_state=tuning_seed,
+        max_concurrent=max_concurrent_trials,
+    )
+    storage_path = str((Path(config.output_dir).resolve() / "ray_tune").resolve())
+    tuner = tune.Tuner(
+        trainable,
+        param_space=search_space,
+        tune_config=tune.TuneConfig(
+            metric="best_validation_macro_f1",
+            mode="max",
+            num_samples=num_samples,
+            search_alg=search_algorithm,
+            max_concurrent_trials=max_concurrent_trials,
+        ),
+        run_config=tune.RunConfig(
+            name=experiment_name,
+            storage_path=storage_path,
+        ),
+    )
+    result_grid = tuner.fit()
+    if result_grid.num_terminated == 0:
+        raise RuntimeError("Ray Tune did not complete any successful trial")
+    best_result = result_grid.get_best_result(
+        metric="best_validation_macro_f1",
+        mode="max",
+        scope="all",
+    )
+    best_learning_rates = {
+        field: float(best_result.config[field])
+        for field in LEARNING_RATE_FIELDS
+    }
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "ray_tune_best_learning_rates.json").open(
+        "w", encoding="utf-8"
+    ) as file:
+        json.dump(
+            {
+                "best_validation_macro_f1": float(
+                    best_result.metrics["best_validation_macro_f1"]
+                ),
+                "tuning_seed": tuning_seed,
+                "search_range": [minimum_learning_rate, maximum_learning_rate],
+                "num_samples": num_samples,
+                "learning_rates": best_learning_rates,
+            },
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+    result_grid.get_dataframe().to_csv(
+        output_dir / "ray_tune_trials.csv",
+        index=False,
+    )
+    return best_learning_rates
 
 def train_one_seed(
     config: UFMSAConfig,
@@ -1051,32 +1383,24 @@ def train_one_seed(
     epochs_without_improvement = 0
 
     for epoch in range(1, config.max_epochs + 1):
-        model.train()
-        epoch_losses: List[float] = []
-        for batch in train_loader:
-            batch = _move_batch(batch, device)
-            optimizer.zero_grad(set_to_none=True)
-            output = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                pixel_values=batch["pixel_values"],
-                frequency_image=batch["frequency_image"],
-                return_details=False,
-            )
-            loss, _ = model.compute_loss(output, batch["label"])
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f"Non-finite loss encountered: {loss.item()}")
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-            optimizer.step()
-            epoch_losses.append(float(loss.item()))
-
-        validation_metrics, _ = evaluate(model, validation_loader, device)
+        training_loss = train_epoch(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            max_grad_norm=config.max_grad_norm,
+        )
+        validation_metrics, _ = evaluate(
+            model,
+            validation_loader,
+            device,
+            collect_details=False,
+        )
         LOGGER.info(
             "seed=%d epoch=%d train_loss=%.6f val_macro_f1=%.6f",
             seed,
             epoch,
-            float(np.mean(epoch_losses)),
+            training_loss,
             validation_metrics.macro_f1,
         )
 
@@ -1100,7 +1424,9 @@ def train_one_seed(
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
-    test_metrics, test_details = evaluate(model, test_loader, device)
+    test_metrics, test_details = evaluate(
+        model, test_loader, device, collect_details=True
+    )
 
     with (run_dir / "test_metrics.json").open("w", encoding="utf-8") as file:
         json.dump(asdict(test_metrics), file, ensure_ascii=False, indent=2)
@@ -1111,7 +1437,6 @@ def train_one_seed(
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     return test_metrics, checkpoint_path
-
 
 def summarize_runs(run_metrics: Mapping[int, Metrics]) -> Dict[str, Dict[str, float]]:
     summary: Dict[str, Dict[str, float]] = {}
@@ -1126,10 +1451,8 @@ def summarize_runs(run_metrics: Mapping[int, Metrics]) -> Dict[str, Dict[str, fl
         }
     return summary
 
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the paper-aligned UFMSA model")
+    parser = argparse.ArgumentParser(description="Train the UFMSA main experiment")
     parser.add_argument("--train-manifest", required=True, help="PATH_TO_TRAIN_MANIFEST")
     parser.add_argument("--validation-manifest", required=True, help="PATH_TO_VALIDATION_MANIFEST")
     parser.add_argument("--test-manifest", required=True, help="PATH_TO_TEST_MANIFEST")
@@ -1149,7 +1472,11 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         default=os.environ.get("UFMSA_OUTPUT_DIR", "PATH_TO_OUTPUT_DIRECTORY"),
     )
-    parser.add_argument("--max-text-length", type=int, default=160)
+    parser.add_argument(
+        "--dataset-name",
+        choices=("weibo", "finefake", "pheme"),
+        required=True,
+    )
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
@@ -1159,15 +1486,25 @@ def parse_args() -> argparse.Namespace:
         default=list(PAPER_SEEDS),
         help="Paper seeds: 13 21 43 2026 3407",
     )
-    parser.add_argument("--mc-samples", type=int, default=20)
-    parser.add_argument(
-        "--mc-scope",
-        choices=("full", "projection_smca"),
-        default="full",
-    )
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--split-tolerance", type=float, default=0.01)
+    parser.add_argument("--ray-tune-num-samples", type=int, default=30)
+    parser.add_argument("--ray-tune-min-learning-rate", type=float, default=1.0e-5)
+    parser.add_argument("--ray-tune-max-learning-rate", type=float, default=1.0e-2)
+    parser.add_argument("--ray-tune-seed", type=int, default=43)
+    parser.add_argument("--ray-tune-cpus-per-trial", type=float, default=4.0)
+    parser.add_argument(
+        "--ray-tune-gpus-per-trial",
+        type=float,
+        default=1.0 if torch.cuda.is_available() else 0.0,
+    )
+    parser.add_argument("--ray-tune-max-concurrent-trials", type=int, default=1)
+    parser.add_argument(
+        "--ray-tune-experiment-name",
+        default="ufmsa_module_learning_rate_search",
+    )
+    parser.add_argument("--skip-ray-tune", action="store_true")
     return parser.parse_args()
-
 
 def main() -> None:
     logging.basicConfig(
@@ -1175,38 +1512,50 @@ def main() -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
     args = parse_args()
+    max_text_length = 160 if args.dataset_name == "weibo" else 50
     config = UFMSAConfig(
         roberta_name_or_path=args.roberta_model,
         vit_name_or_path=args.vit_model,
         image_root=args.image_root,
         output_dir=args.output_dir,
         local_files_only=args.local_files_only,
-        mc_samples=args.mc_samples,
-        mc_scope=args.mc_scope,
+        dataset_name=args.dataset_name,
+        max_text_length=max_text_length,
         num_workers=args.num_workers,
     )
     config.validate()
-
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    split_summary = validate_main_experiment_manifests(
+        train_manifest=args.train_manifest,
+        validation_manifest=args.validation_manifest,
+        test_manifest=args.test_manifest,
+        tolerance=args.split_tolerance,
+    )
+    with (output_dir / "data_split_summary.json").open("w", encoding="utf-8") as file:
+        json.dump(split_summary, file, ensure_ascii=False, indent=2)
+
+    if not args.skip_ray_tune:
+        best_learning_rates = run_ray_tune(
+            config=config,
+            train_manifest=args.train_manifest,
+            validation_manifest=args.validation_manifest,
+            num_samples=args.ray_tune_num_samples,
+            minimum_learning_rate=args.ray_tune_min_learning_rate,
+            maximum_learning_rate=args.ray_tune_max_learning_rate,
+            tuning_seed=args.ray_tune_seed,
+            cpus_per_trial=args.ray_tune_cpus_per_trial,
+            gpus_per_trial=args.ray_tune_gpus_per_trial,
+            max_concurrent_trials=args.ray_tune_max_concurrent_trials,
+            experiment_name=f"{args.ray_tune_experiment_name}_{args.dataset_name}",
+        )
+        config = config_with_learning_rates(config, best_learning_rates)
+
     with (output_dir / "configuration.json").open("w", encoding="utf-8") as file:
         json.dump(asdict(config), file, ensure_ascii=False, indent=2)
 
-    if AutoTokenizer is None or AutoImageProcessor is None:
-        raise ImportError(
-            "The `transformers` package is required. Install it with `pip install transformers`."
-        )
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.roberta_name_or_path,
-        local_files_only=config.local_files_only,
-        use_fast=True,
-    )
-    image_processor = AutoImageProcessor.from_pretrained(
-        config.vit_name_or_path,
-        local_files_only=config.local_files_only,
-    )
+    tokenizer, image_processor = load_processors(config)
     device = torch.device(args.device)
-
     run_metrics: Dict[int, Metrics] = {}
     for seed in args.seeds:
         train_loader = build_dataloader(
@@ -1214,7 +1563,7 @@ def main() -> None:
             tokenizer=tokenizer,
             image_processor=image_processor,
             image_root=config.image_root,
-            max_text_length=args.max_text_length,
+            max_text_length=config.max_text_length,
             image_size=config.image_size,
             batch_size=config.batch_size,
             shuffle=True,
@@ -1226,7 +1575,7 @@ def main() -> None:
             tokenizer=tokenizer,
             image_processor=image_processor,
             image_root=config.image_root,
-            max_text_length=args.max_text_length,
+            max_text_length=config.max_text_length,
             image_size=config.image_size,
             batch_size=config.batch_size,
             shuffle=False,
@@ -1238,7 +1587,7 @@ def main() -> None:
             tokenizer=tokenizer,
             image_processor=image_processor,
             image_root=config.image_root,
-            max_text_length=args.max_text_length,
+            max_text_length=config.max_text_length,
             image_size=config.image_size,
             batch_size=config.batch_size,
             shuffle=False,
@@ -1260,7 +1609,6 @@ def main() -> None:
     with (output_dir / "five_seed_summary.json").open("w", encoding="utf-8") as file:
         json.dump(summary, file, ensure_ascii=False, indent=2)
     LOGGER.info("Five-seed summary: %s", json.dumps(summary, ensure_ascii=False))
-
 
 if __name__ == "__main__":
     main()
