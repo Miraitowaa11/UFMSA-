@@ -774,7 +774,7 @@ class HierarchicalUncertaintyFusion(nn.Module):
     @staticmethod
    def _feature_uncertainty(samples: torch.Tensor) -> torch.Tensor:
        sample_mean = samples.mean(dim=0, keepdim=True)
-       turn (samples - sample_mean).square().mean(dim=-1).mean(dim=0)
+       return (samples - sample_mean).square().mean(dim=-1).mean(dim=0)
 
     def _decision_uncertainty(
         self, samples: torch.Tensor
